@@ -1,0 +1,2 @@
+# Startup Validator CLI
+# No external dependencies required - uses Python standard library only
