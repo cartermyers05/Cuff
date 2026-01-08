@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
 Startup Validator CLI - Brutally honest business idea validation tool
+V2: Fixed weights, added skepticism, execution risk penalty
 
 Usage:
     python validate.py "Your business idea" "Target customer" "Price point"
@@ -10,7 +11,6 @@ Example:
 """
 
 import sys
-import json
 import re
 from dataclasses import dataclass
 from typing import Optional
@@ -33,6 +33,8 @@ USER_CONTEXT = {
         "projects_with_10_customers": 0,
         "average_quit_weeks": 6,
         "estimation_multiplier": 4,  # Says 2 weeks, takes 8
+        "completion_rate": 0.20,  # 1/5 shipped
+        "success_rate": 0.00,     # 0/5 got 10 customers
     },
     "personality": {
         "hates_long_sales_cycles": True,
@@ -44,183 +46,178 @@ USER_CONTEXT = {
 }
 
 # ============================================================================
-# SCORING CATEGORIES WITH WEIGHTS
+# SCORING CATEGORIES WITH WEIGHTS (NOW SUM TO 100%)
 # ============================================================================
 
 CATEGORIES = {
+    # === HIGH IMPACT (60% total) ===
     "demand_signals": {
         "name": "Demand Signals",
-        "weight": 0.15,
+        "weight": 0.12,  # Was 0.15
         "description": "Reddit posts, Twitter complaints, Google Trends for the problem",
         "questions": [
-            "Can you find 20+ Reddit/Twitter posts complaining about this problem?",
+            "Can you find 20+ Reddit/Twitter posts complaining about this SPECIFIC problem?",
             "Is Google Trends showing growth for related keywords?",
-            "Are people actively searching for solutions?",
+            "Are people actively searching for PAID solutions (not just free)?",
         ],
+        "skeptical_note": "Finding complaints ≠ willingness to pay. People complain about free things too.",
     },
+    "distribution": {
+        "name": "Distribution",
+        "weight": 0.15,  # Was 0.12 - THIS IS YOUR BIGGEST BOTTLENECK
+        "description": "Can YOU reach these customers (not theoretical)",
+        "questions": [
+            "Can you reach 100 potential customers THIS WEEK without ads?",
+            "Do you have direct access to where they hang out?",
+            "Have you successfully sold to this audience before?",
+        ],
+        "hard_stop_threshold": 4,
+        "skeptical_note": "200 Twitter followers is not distribution. Be honest about your reach.",
+    },
+    "free_alternatives": {
+        "name": "Free Alternatives",
+        "weight": 0.10,  # NEW CATEGORY
+        "description": "How strong are free options (ChatGPT, Reddit, friends, DIY)",
+        "questions": [
+            "Can someone get 80% of the value for FREE (ChatGPT, Reddit, friends)?",
+            "Is this competing with 'free advice from the internet'?",
+            "Why would someone PAY when free options exist?",
+        ],
+        "skeptical_note": "If ChatGPT or Reddit can do it free, your paid version needs 10x value.",
+        "inverse_scoring": True,  # Lower is better (fewer free alternatives = good)
+    },
+    "customer_asks": {
+        "name": "Customer Asks (PAID)",
+        "weight": 0.10,  # Was 0.10
+        "description": "Are people asking AND PAYING for this specific solution",
+        "questions": [
+            "Can you find people who ALREADY PAID for something similar?",
+            "Are there feature requests with 'I would pay for this'?",
+            "Is anyone currently paying for a worse version?",
+        ],
+        "skeptical_note": "'Cool idea' ≠ 'I will pay'. Only count explicit payment intent.",
+    },
+    "founder_market_fit": {
+        "name": "Founder-Market Fit",
+        "weight": 0.13,  # Was 0.08 - CRITICAL FOR YOUR QUIT PATTERN
+        "description": "Does this match your personality AND will you finish it",
+        "questions": [
+            "Is the sales motion compatible with your personality?",
+            "Can you get revenue in week 1-2 (before your quit window)?",
+            "Will you still care about this after the initial excitement fades?",
+        ],
+        "skeptical_note": "You quit at week 6. If revenue comes after week 6, you'll quit first.",
+    },
+
+    # === MEDIUM IMPACT (30% total) ===
     "competition": {
         "name": "Competition",
-        "weight": 0.10,
+        "weight": 0.06,  # Was 0.10
         "description": "Who exists, their pricing, their weaknesses",
         "questions": [
-            "Who are the top 3 competitors?",
+            "Who are the top 3 competitors and what do they charge?",
             "What do their 1-star reviews say?",
-            "Is there a clear weakness you can exploit?",
+            "Why haven't they already won the market?",
         ],
         "hard_stop_threshold": 3,
-    },
-    "icp_validation": {
-        "name": "ICP Validation",
-        "weight": 0.07,
-        "description": "How specific and reachable is the target customer",
-        "questions": [
-            "Can you describe your ideal customer in one sentence?",
-            "Do you know where they hang out online?",
-            "Can you find 10 of them right now?",
-        ],
+        "skeptical_note": "If competitors exist and have customers, the market is validated but crowded.",
     },
     "market_gap": {
         "name": "Market Gap",
-        "weight": 0.10,
+        "weight": 0.06,  # Was 0.10
         "description": "What's missing that you can fill",
         "questions": [
             "What specific need is unmet by current solutions?",
-            "Why hasn't someone built this already?",
-            "Is the gap big enough to matter?",
+            "Is the gap big enough that people will SWITCH or PAY MORE?",
+            "Why hasn't someone filled this gap already?",
         ],
+        "skeptical_note": "If nobody filled the gap, maybe the gap doesn't matter to customers.",
     },
-    "customer_asks": {
-        "name": "Customer Asks",
-        "weight": 0.10,
-        "description": "Are people asking for this specific solution",
+    "unit_economics": {
+        "name": "Unit Economics",
+        "weight": 0.08,  # NEW CATEGORY
+        "description": "Does the math work? Price vs time vs scalability",
         "questions": [
-            "Are people explicitly asking for this solution?",
-            "Can you find feature requests for this on competitor forums?",
-            "Are there 'I wish X existed' posts?",
+            "What's your effective hourly rate? (Price ÷ hours per customer)",
+            "Can you make $50+/hour, or is this below minimum wage?",
+            "Does this scale, or are you trading time for money forever?",
         ],
+        "skeptical_note": "$49 ÷ 3 hours = $16/hour. That's not a business, it's a bad job.",
     },
     "churn_risk": {
-        "name": "Churn Risk",
-        "weight": 0.05,
+        "name": "Churn / Repeat Purchase",
+        "weight": 0.05,  # Was 0.05
         "description": "Is this a one-time need or recurring",
         "questions": [
             "Will customers need this monthly or just once?",
-            "What keeps them coming back?",
-            "Is there a switching cost?",
+            "What's the realistic LTV (lifetime value)?",
+            "How many times will the average customer buy?",
         ],
+        "skeptical_note": "One-time purchases = constant acquisition treadmill. Recurring = stability.",
     },
-    "failed_alternatives": {
-        "name": "Failed Alternatives",
-        "weight": 0.04,
-        "description": "Did similar ideas fail? Why?",
+    "sales_cycle": {
+        "name": "Sales Cycle",
+        "weight": 0.05,  # Was 0.05
+        "description": "Same-day purchase vs months of selling",
         "questions": [
-            "Have similar products failed before?",
-            "Why did they fail?",
-            "What would you do differently?",
+            "Can someone buy in under 10 minutes with no call?",
+            "Does it require demos, calls, or committee approval?",
+            "Is the price low enough for impulse purchase?",
+        ],
+        "skeptical_note": "You hate sales calls. If this requires calls, you won't do them.",
+    },
+
+    # === LOWER IMPACT (10% total) ===
+    "icp_validation": {
+        "name": "ICP Validation",
+        "weight": 0.02,  # Was 0.07
+        "description": "How specific and reachable is the target customer",
+        "questions": [
+            "Can you describe your ideal customer in one specific sentence?",
+            "Can you find 10 of them by name right now?",
         ],
     },
     "buy_vs_build": {
         "name": "Buy vs Build",
-        "weight": 0.07,
+        "weight": 0.02,  # Was 0.07
         "description": "Are people trying to DIY this and failing",
         "questions": [
-            "Are people cobbling together solutions with spreadsheets/Zapier?",
-            "How much time are they wasting on DIY?",
+            "Are people cobbling together solutions and HATING it?",
             "Would they pay to save that time?",
         ],
     },
     "price_sensitivity": {
         "name": "Price Sensitivity",
-        "weight": 0.05,
+        "weight": 0.02,  # Was 0.05
         "description": "Will they pay your price point",
         "questions": [
             "What are competitors charging?",
-            "Does your price fit the customer's budget?",
-            "Is this a 'nice to have' or 'must have' purchase?",
-        ],
-    },
-    "sales_cycle": {
-        "name": "Sales Cycle",
-        "weight": 0.05,
-        "description": "Same-day purchase vs months of selling",
-        "questions": [
-            "Can someone buy in under 10 minutes?",
-            "Does it require demos or calls?",
-            "Is there a committee approval process?",
+            "Is this a 'must have' or 'nice to have'?",
         ],
     },
     "tam": {
         "name": "TAM (Total Addressable Market)",
-        "weight": 0.05,
+        "weight": 0.02,  # Was 0.05
         "description": "Total addressable market size",
         "questions": [
             "How many potential customers exist?",
-            "What's the realistic revenue ceiling?",
-            "Is the market growing?",
-        ],
-    },
-    "trend_backing": {
-        "name": "Trend Backing",
-        "weight": 0.04,
-        "description": "Is this space growing or dying",
-        "questions": [
-            "Is this industry growing or shrinking?",
-            "Are there tailwinds (AI, remote work, etc.)?",
-            "Will this be more or less relevant in 2 years?",
-        ],
-    },
-    "integration_complexity": {
-        "name": "Integration Complexity",
-        "weight": 0.03,
-        "description": "How hard to set up",
-        "questions": [
-            "Can users start in under 5 minutes?",
-            "Does it require IT department involvement?",
-            "Are there complex integrations needed?",
+            "Is the market big enough to matter but small enough to target?",
         ],
     },
     "payment_friction": {
         "name": "Payment Friction",
-        "weight": 0.05,
+        "weight": 0.02,  # Was 0.05
         "description": "Individual credit card vs enterprise procurement",
         "questions": [
-            "Can they pay with a personal/corporate card?",
-            "Is procurement/legal approval needed?",
-            "Is the price under the 'expense report' threshold?",
-        ],
-    },
-    "distribution": {
-        "name": "Distribution",
-        "weight": 0.12,
-        "description": "Can YOU reach these customers (not theoretical)",
-        "questions": [
-            "Where do your target customers hang out that YOU have access to?",
-            "Can you reach 100 of them this week?",
-            "Do you have any existing audience overlap?",
-        ],
-        "hard_stop_threshold": 4,
-    },
-    "unfair_advantage": {
-        "name": "Unfair Advantage",
-        "weight": 0.08,
-        "description": "Your specific edge",
-        "questions": [
-            "Why are YOU the right person to build this?",
-            "What do you know that others don't?",
-            "Do you have unique access to customers/data/skills?",
-        ],
-    },
-    "founder_market_fit": {
-        "name": "Founder-Market Fit",
-        "weight": 0.08,
-        "description": "Does this match your personality/skills",
-        "questions": [
-            "Does this match your strengths?",
-            "Will you still care about this in 6 months?",
-            "Is the sales motion compatible with your personality?",
+            "Can they pay with a personal/corporate card instantly?",
+            "Is the price under the 'expense report' threshold (~$500)?",
         ],
     },
 }
+
+# Verify weights sum to 1.0
+_total_weight = sum(cat["weight"] for cat in CATEGORIES.values())
+assert abs(_total_weight - 1.0) < 0.01, f"Weights must sum to 1.0, got {_total_weight}"
 
 # ============================================================================
 # HARD STOP RULES
@@ -268,6 +265,21 @@ HARD_STOP_RULES = [
         "name": "Can't Reach Customers (Distribution <4)",
         "description": "If you can't reach customers, nothing else matters",
         "category_link": "distribution",
+    },
+    {
+        "id": "free_alternative_dominant",
+        "name": "Free Alternative Too Strong",
+        "description": "If free options score 8+, you're competing with free",
+        "category_link": "free_alternatives",
+        "threshold": 8,
+        "inverse": True,  # High score = bad for this category
+    },
+    {
+        "id": "bad_unit_economics",
+        "name": "Unit Economics Don't Work (<$30/hr)",
+        "description": "If you're making less than $30/hr, it's a job not a business",
+        "category_link": "unit_economics",
+        "threshold": 4,
     },
 ]
 
@@ -324,6 +336,12 @@ RATIONALIZATION_PATTERNS = [
         "warning": "Organic growth requires an audience. You have 200 Twitter followers.",
         "past_project": "hoping for virality instead of doing distribution",
     },
+    {
+        "pattern": r"(chatgpt|ai|free).*(can't|won't|doesn't)",
+        "condition": lambda scores: scores.get("free_alternatives", 10) > 6,
+        "warning": "You're dismissing free alternatives. Users will try free first.",
+        "past_project": "underestimating how cheap your target market is",
+    },
 ]
 
 # ============================================================================
@@ -348,8 +366,10 @@ class ValidationResult:
     hard_stops_triggered: list
     rationalizations_detected: list
     final_score: float
+    adjusted_score: float  # After execution risk penalty
     verdict: Verdict
     action_items: list
+    warnings: list
 
 def get_color(score: float) -> str:
     """Return ANSI color code based on score."""
@@ -365,6 +385,9 @@ def reset_color() -> str:
 
 def bold() -> str:
     return "\033[1m"
+
+def dim() -> str:
+    return "\033[2m"
 
 def print_header(text: str):
     """Print a section header."""
@@ -387,6 +410,9 @@ def prompt_score(category_key: str, category: dict) -> float:
 
     for i, q in enumerate(category.get('questions', []), 1):
         print(f"   {i}. {q}")
+
+    if 'skeptical_note' in category:
+        print(f"\n   {dim()}⚠️  {category['skeptical_note']}{reset_color()}")
 
     while True:
         try:
@@ -446,17 +472,55 @@ def calculate_final_score(scores: dict) -> float:
     """Calculate weighted final score."""
     total = 0.0
     for key, score in scores.items():
-        weight = CATEGORIES[key]["weight"]
-        total += score * weight
+        if key in CATEGORIES:
+            weight = CATEGORIES[key]["weight"]
+            total += score * weight
     return total
 
-def get_verdict(score: float, hard_stops: list) -> Verdict:
-    """Determine verdict based on score and hard stops."""
+def calculate_execution_risk_penalty(scores: dict) -> tuple[float, list]:
+    """
+    Calculate penalty based on user's track record and idea fit.
+    Returns (penalty_multiplier, warnings)
+    """
+    warnings = []
+    penalty = 0.0
+
+    # Base penalty for track record: 0/5 success = 20% penalty
+    success_rate = USER_CONTEXT["track_record"]["success_rate"]
+    track_record_penalty = (1 - success_rate) * 0.15  # Max 15% penalty
+    penalty += track_record_penalty
+    if track_record_penalty > 0:
+        warnings.append(f"Track record penalty: -{track_record_penalty*100:.0f}% (0/{USER_CONTEXT['track_record']['projects_started']} projects reached 10 customers)")
+
+    # Penalty if founder-market fit is low
+    fmf_score = scores.get("founder_market_fit", 5)
+    if fmf_score < 7:
+        fmf_penalty = (7 - fmf_score) * 0.03  # Up to 21% penalty
+        penalty += fmf_penalty
+        warnings.append(f"Founder-market fit penalty: -{fmf_penalty*100:.0f}% (score {fmf_score}/10)")
+
+    # Penalty if this requires sales calls and user hates them
+    sales_score = scores.get("sales_cycle", 5)
+    if sales_score < 6 and USER_CONTEXT["personality"]["hates_long_sales_cycles"]:
+        sales_penalty = 0.10
+        penalty += sales_penalty
+        warnings.append(f"Sales cycle mismatch penalty: -{sales_penalty*100:.0f}% (requires calls, you hate calls)")
+
+    # Penalty if revenue comes late (after week 6 quit window)
+    if scores.get("sales_cycle", 5) < 5:  # Long sales cycle
+        quit_penalty = 0.10
+        penalty += quit_penalty
+        warnings.append(f"Quit window risk: -{quit_penalty*100:.0f}% (revenue likely comes after your week 6 quit point)")
+
+    return (1 - min(penalty, 0.50)), warnings  # Max 50% penalty
+
+def get_verdict(score: float, adjusted_score: float, hard_stops: list) -> Verdict:
+    """Determine verdict based on ADJUSTED score and hard stops."""
     if hard_stops:
         return Verdict.STOP
-    if score >= 8.0:
+    if adjusted_score >= 8.0:
         return Verdict.BUILD_NOW
-    if score >= 6.0:
+    if adjusted_score >= 6.0:
         return Verdict.VALIDATE_FIRST
     return Verdict.STOP
 
@@ -477,6 +541,8 @@ def generate_action_items(scores: dict, verdict: Verdict) -> list:
     items.append(f"📅 2-WEEK VALIDATION SPRINT:")
 
     for key, score in weak_categories:
+        if key not in CATEGORIES:
+            continue
         cat = CATEGORIES[key]
         if key == "demand_signals" and score < 7:
             items.append(f"  • Week 1: Find 20 Reddit/Twitter posts about this problem")
@@ -485,14 +551,14 @@ def generate_action_items(scores: dict, verdict: Verdict) -> list:
             items.append(f"  • Week 1: DM 20 potential customers on Twitter/Reddit")
             items.append(f"  • Week 1: Post in r/SaaS, r/indiehackers asking for feedback")
         elif key == "customer_asks" and score < 7:
-            items.append(f"  • Week 1: Find 10 feature requests on competitor forums")
-            items.append(f"  • Week 1: Search 'I wish [X] existed' posts")
-        elif key == "icp_validation" and score < 7:
-            items.append(f"  • Week 1: Write down 10 SPECIFIC people (names) who need this")
-            items.append(f"  • Week 1: DM all 10 and ask about their current solution")
-        elif key == "competition" and score < 7:
-            items.append(f"  • Week 1: Sign up for top 3 competitors")
-            items.append(f"  • Week 1: Document every weakness and complaint")
+            items.append(f"  • Week 1: Find 10 people who PAID for something similar")
+            items.append(f"  • Week 1: Search 'I would pay for X' posts (not just 'I wish')")
+        elif key == "free_alternatives" and score > 6:
+            items.append(f"  • Week 1: List all free alternatives (ChatGPT, Reddit, DIY)")
+            items.append(f"  • Week 1: Define your 10x value over free options")
+        elif key == "unit_economics" and score < 6:
+            items.append(f"  • Week 1: Calculate true hours per customer")
+            items.append(f"  • Week 1: Find ways to 3x your effective hourly rate")
 
     items.append(f"\n📊 VALIDATION CRITERIA:")
     items.append(f"  • Get 5 'I would pay for this' responses (not 'cool idea')")
@@ -527,16 +593,17 @@ def print_validation_result(result: ValidationResult):
     }
 
     color = verdict_colors[result.verdict]
-    score_color = get_color(result.final_score)
+    score_color = get_color(result.adjusted_score)
 
-    print(f"\n  {bold()}{score_color}SCORE: {result.final_score:.1f}/10{reset_color()}")
+    print(f"\n  {bold()}RAW SCORE: {result.final_score:.1f}/10{reset_color()}")
+    print(f"  {bold()}{score_color}ADJUSTED SCORE: {result.adjusted_score:.1f}/10{reset_color()} (after execution risk)")
     print(f"  {bold()}{color}VERDICT: {result.verdict.value}{reset_color()}")
 
     if result.verdict == Verdict.BUILD_NOW:
         print(f"\n  ✅ Green light to build. But remember:")
         print(f"     • Your estimation is 4x off. Plan for that.")
         print(f"     • You've shipped 1/5 projects. Commit to finishing.")
-        print(f"     • Distribution is still your weakest link.")
+        print(f"     • Get PAYING customers in week 1-2 or you'll quit.")
     elif result.verdict == Verdict.VALIDATE_FIRST:
         print(f"\n  ⚠️  Promising but needs validation before building")
         print(f"     • Do NOT write code yet")
@@ -546,6 +613,12 @@ def print_validation_result(result: ValidationResult):
         print(f"\n  🛑 Do not proceed with this idea")
         print(f"     • This is not a 'try harder' situation")
         print(f"     • Move on to the next idea")
+
+    # Execution Risk Warnings
+    if result.warnings:
+        print_header("⚠️  EXECUTION RISK ADJUSTMENTS")
+        for w in result.warnings:
+            print(f"  • {w}")
 
     # Hard Stops
     if result.hard_stops_triggered:
@@ -558,7 +631,7 @@ def print_validation_result(result: ValidationResult):
     print_header("CATEGORY BREAKDOWN")
 
     sorted_categories = sorted(
-        result.category_scores.items(),
+        [(k, v) for k, v in result.category_scores.items() if k in CATEGORIES],
         key=lambda x: CATEGORIES[x[0]]["weight"],
         reverse=True
     )
@@ -568,11 +641,13 @@ def print_validation_result(result: ValidationResult):
         print_category_score(cat["name"], score, cat["weight"], cat["description"])
 
     print(f"\n  {'-'*50}")
-    print(f"  {'WEIGHTED TOTAL':.<30} {bold()}{get_color(result.final_score)}{result.final_score:.2f}/10{reset_color()}")
+    print(f"  {'RAW WEIGHTED TOTAL':.<30} {result.final_score:.2f}/10")
+    print(f"  {'EXECUTION RISK PENALTY':.<30} {dim()}-{(result.final_score - result.adjusted_score):.2f}{reset_color()}")
+    print(f"  {'ADJUSTED TOTAL':.<30} {bold()}{get_color(result.adjusted_score)}{result.adjusted_score:.2f}/10{reset_color()}")
 
     # Anti-Rationalization Warnings
     if result.rationalizations_detected:
-        print_header("⚠️  RATIONALIZATION DETECTED")
+        print_header("🧠 RATIONALIZATION DETECTED")
         for r in result.rationalizations_detected:
             print(f"\n  🧠 {r['warning']}")
             print(f"     ↳ This is the same thinking that killed: {r['past_project']}")
@@ -590,17 +665,18 @@ def print_validation_result(result: ValidationResult):
     • Reddit: Access to {', '.join(USER_CONTEXT['distribution']['reddit_access'])}
     • Email list: {USER_CONTEXT['distribution']['email_list']} subscribers
 
-  Track Record:
+  Track Record (THIS MATTERS):
     • Projects started: {USER_CONTEXT['track_record']['projects_started']}
     • Projects shipped: {USER_CONTEXT['track_record']['projects_shipped']}
     • Projects with 10+ customers: {USER_CONTEXT['track_record']['projects_with_10_customers']}
     • Average quit time: {USER_CONTEXT['track_record']['average_quit_weeks']} weeks
     • Estimation accuracy: {USER_CONTEXT['track_record']['estimation_multiplier']}x off
+    • Success rate: {USER_CONTEXT['track_record']['success_rate']*100:.0f}%
 
   Personality Fit Check:
-    • ✓ Self-serve product? {result.category_scores.get('payment_friction', 5) >= 7}
-    • ✓ Short sales cycle? {result.category_scores.get('sales_cycle', 5) >= 7}
-    • ✓ Async-friendly? {result.category_scores.get('integration_complexity', 5) >= 6}
+    • ✓ Self-serve product? {result.category_scores.get('sales_cycle', 5) >= 7}
+    • ✓ No sales calls needed? {result.category_scores.get('sales_cycle', 5) >= 6}
+    • ✓ Revenue before week 6? {result.category_scores.get('founder_market_fit', 5) >= 7}
 """)
 
     print("\n" + "🎯" * 30 + "\n")
@@ -609,7 +685,7 @@ def run_interactive_validation(idea: str, target: str, price: str) -> Validation
     """Run the full interactive validation flow."""
 
     print("\n" + "="*60)
-    print(f"{bold()}🔍 STARTUP VALIDATOR - Brutally Honest Edition{reset_color()}")
+    print(f"{bold()}🔍 STARTUP VALIDATOR V2 - Skeptical Edition{reset_color()}")
     print("="*60)
     print(f"\nValidating: {idea}")
     print(f"Target: {target}")
@@ -632,6 +708,14 @@ def run_interactive_validation(idea: str, target: str, price: str) -> Validation
     if scores.get("distribution", 10) < 4:
         hard_stops.append(next(r for r in HARD_STOP_RULES if r["id"] == "no_distribution"))
 
+    # Free alternatives hard stop (inverse - high score is bad)
+    if scores.get("free_alternatives", 0) >= 8:
+        hard_stops.append(next(r for r in HARD_STOP_RULES if r["id"] == "free_alternative_dominant"))
+
+    # Unit economics hard stop
+    if scores.get("unit_economics", 10) < 4:
+        hard_stops.append(next(r for r in HARD_STOP_RULES if r["id"] == "bad_unit_economics"))
+
     # Prompted hard stops
     print_header("HARD STOP CHECKS")
     for rule in HARD_STOP_RULES:
@@ -646,8 +730,12 @@ def run_interactive_validation(idea: str, target: str, price: str) -> Validation
     # Calculate final score
     final_score = calculate_final_score(scores)
 
-    # Get verdict
-    verdict = get_verdict(final_score, hard_stops)
+    # Calculate execution risk penalty
+    penalty_multiplier, warnings = calculate_execution_risk_penalty(scores)
+    adjusted_score = final_score * penalty_multiplier
+
+    # Get verdict based on ADJUSTED score
+    verdict = get_verdict(final_score, adjusted_score, hard_stops)
 
     # Generate action items
     action_items = generate_action_items(scores, verdict)
@@ -660,52 +748,50 @@ def run_interactive_validation(idea: str, target: str, price: str) -> Validation
         hard_stops_triggered=hard_stops,
         rationalizations_detected=rationalizations,
         final_score=final_score,
+        adjusted_score=adjusted_score,
         verdict=verdict,
         action_items=action_items,
+        warnings=warnings,
     )
 
 def run_demo_validation() -> ValidationResult:
     """Run a demo validation with sample scores to show output format."""
 
-    # Sample idea
     idea = "AI tool that writes personalized cold emails for B2B sales"
     target = "B2B SaaS founders doing outbound sales"
     price = "$49/month"
 
-    # Sample scores (realistic mixed bag)
     scores = {
-        "demand_signals": 7.0,      # Lots of cold email complaints
-        "competition": 5.0,         # Lemlist, Instantly exist
-        "icp_validation": 6.0,      # Can find them on Twitter
-        "market_gap": 6.0,          # Personalization is weak in existing tools
-        "customer_asks": 7.0,       # People complain about generic emails
-        "churn_risk": 5.0,          # Monthly need but might churn
-        "failed_alternatives": 7.0, # Some failed but for different reasons
-        "buy_vs_build": 8.0,        # People use templates + ChatGPT
-        "price_sensitivity": 7.0,   # $49 is reasonable
-        "sales_cycle": 8.0,         # Self-serve possible
-        "tam": 7.0,                 # Decent market
-        "trend_backing": 8.0,       # AI is hot
-        "integration_complexity": 7.0,  # Can be simple
-        "payment_friction": 8.0,    # Credit card OK
-        "distribution": 4.0,        # Weak - your bottleneck
-        "unfair_advantage": 4.0,    # Nothing special
-        "founder_market_fit": 6.0,  # Research/AI matches, sales doesn't
+        "demand_signals": 7.0,
+        "distribution": 4.0,        # Your bottleneck
+        "free_alternatives": 7.0,   # ChatGPT can do this
+        "customer_asks": 6.0,
+        "founder_market_fit": 5.0,  # Sales-heavy doesn't fit you
+        "competition": 4.0,         # Lemlist, Instantly exist
+        "market_gap": 5.0,
+        "unit_economics": 6.0,
+        "churn_risk": 5.0,
+        "sales_cycle": 7.0,
+        "icp_validation": 6.0,
+        "buy_vs_build": 7.0,
+        "price_sensitivity": 7.0,
+        "tam": 7.0,
+        "payment_friction": 8.0,
     }
 
-    # Sample hard stops (distribution triggers one)
     hard_stops = []
     if scores.get("distribution", 10) < 4:
         hard_stops.append(next(r for r in HARD_STOP_RULES if r["id"] == "no_distribution"))
 
-    # Sample rationalization (simulate user saying they can build it in 2 weeks)
     rationalizations = [{
         "warning": "Your historical accuracy is 4x off. '2 weeks' means 8 weeks. Plan accordingly.",
         "past_project": "every project you've ever estimated",
     }]
 
     final_score = calculate_final_score(scores)
-    verdict = get_verdict(final_score, hard_stops)
+    penalty_multiplier, warnings = calculate_execution_risk_penalty(scores)
+    adjusted_score = final_score * penalty_multiplier
+    verdict = get_verdict(final_score, adjusted_score, hard_stops)
     action_items = generate_action_items(scores, verdict)
 
     return ValidationResult(
@@ -716,8 +802,10 @@ def run_demo_validation() -> ValidationResult:
         hard_stops_triggered=hard_stops,
         rationalizations_detected=rationalizations,
         final_score=final_score,
+        adjusted_score=adjusted_score,
         verdict=verdict,
         action_items=action_items,
+        warnings=warnings,
     )
 
 
@@ -729,12 +817,17 @@ def run_idea_validation(idea: str, target: str, price: str, scores: dict, notes:
         hard_stops.append(next(r for r in HARD_STOP_RULES if r["id"] == "competition_dominated"))
     if scores.get("distribution", 10) < 4:
         hard_stops.append(next(r for r in HARD_STOP_RULES if r["id"] == "no_distribution"))
+    if scores.get("free_alternatives", 0) >= 8:
+        hard_stops.append(next(r for r in HARD_STOP_RULES if r["id"] == "free_alternative_dominant"))
+    if scores.get("unit_economics", 10) < 4:
+        hard_stops.append(next(r for r in HARD_STOP_RULES if r["id"] == "bad_unit_economics"))
 
     rationalizations = []
     final_score = calculate_final_score(scores)
-    verdict = get_verdict(final_score, hard_stops)
+    penalty_multiplier, warnings = calculate_execution_risk_penalty(scores)
+    adjusted_score = final_score * penalty_multiplier
+    verdict = get_verdict(final_score, adjusted_score, hard_stops)
 
-    # Custom action items for BUILD NOW
     if verdict == Verdict.BUILD_NOW:
         action_items = [
             "✅ GREEN LIGHT - But follow these rules:",
@@ -742,18 +835,18 @@ def run_idea_validation(idea: str, target: str, price: str, scores: dict, notes:
             "📅 WEEK 1 - VALIDATE BEFORE BUILDING:",
             "  • Post in r/SaaS: 'Would you pay $X for [idea]? Be honest.'",
             "  • DM 10 people who posted 'should I build X' threads",
-            "  • Offer 3 FREE reports to get testimonials",
+            "  • Offer 3 FREE deliveries to get testimonials",
             "  • Goal: 5 people say 'yes I'd pay' (not 'cool idea')",
             "",
             "📅 WEEK 2 - MINIMUM VIABLE SERVICE:",
             "  • Set up Gumroad/Stripe payment link",
             "  • Create simple intake form (Tally/Typeform)",
-            "  • Deliver first 3 paid reports manually",
+            "  • Deliver first 3 PAID orders manually",
             "  • DO NOT BUILD AUTOMATION YET",
             "",
             "⚠️ CONSTRAINTS (based on your history):",
-            f"  • You said 2 weeks = actually 8 weeks. Plan for that.",
-            "  • You quit at week 6. Set a 'no quit' commitment.",
+            "  • You said 2 weeks = actually 8 weeks. Plan for that.",
+            "  • You quit at week 6. Get revenue BEFORE week 6.",
             "  • 5 started, 0 with 10 customers. Goal: 10 paying customers before ANY automation.",
             "",
             "🎯 SUCCESS CRITERIA:",
@@ -772,97 +865,84 @@ def run_idea_validation(idea: str, target: str, price: str, scores: dict, notes:
         hard_stops_triggered=hard_stops,
         rationalizations_detected=rationalizations,
         final_score=final_score,
+        adjusted_score=adjusted_score,
         verdict=verdict,
         action_items=action_items,
+        warnings=warnings,
     )
 
 def print_usage():
     """Print usage information."""
     print("""
 ╔══════════════════════════════════════════════════════════════╗
-║              STARTUP VALIDATOR CLI                           ║
-║         Brutally Honest Business Idea Validation             ║
+║           STARTUP VALIDATOR CLI V2                           ║
+║      Brutally Honest + Skeptical + Execution Risk            ║
 ╚══════════════════════════════════════════════════════════════╝
 
 USAGE:
     python validate.py "<idea>" "<target customer>" "<price>"
     python validate.py --demo    # See example output
-    python validate.py --quick "<idea>" "<target>" "<price>"  # Fast mode (5 key questions)
+    python validate.py --quick "<idea>" "<target>" "<price>"  # Fast mode
 
-EXAMPLES:
-    python validate.py "AI cold email writer" "B2B SaaS founders" "$29/mo"
-    python validate.py "Notion template marketplace" "productivity enthusiasts" "$19 one-time"
-    python validate.py "Discord bot for DAOs" "Web3 community managers" "$99/mo"
-
-WHAT IT DOES:
-    1. Scores your idea across 17 weighted categories
-    2. Checks for hard-stop deal-breakers
-    3. Detects rationalization patterns
-    4. Gives you a BUILD NOW / VALIDATE FIRST / STOP verdict
-    5. Provides specific action items
-
-MODES:
-    (default)  Full validation - all 17 categories + hard stop checks
-    --demo     Show example output without answering questions
-    --quick    Fast mode - only 5 key questions for rapid screening
+WHAT'S NEW IN V2:
+    • Fixed weights (now sum to exactly 100%)
+    • Added "Free Alternatives" category (competing with free)
+    • Added "Unit Economics" category (price vs hours)
+    • Execution Risk Penalty based on YOUR track record
+    • More skeptical scoring questions
+    • Adjusted score = Raw score × Execution risk multiplier
 
 SCORING:
-    8.0+ = BUILD NOW (with caveats)
-    6.0-7.9 = VALIDATE FIRST (2-week sprint)
-    <6.0 = STOP (move on)
+    8.0+ ADJUSTED = BUILD NOW (rare - you need a great idea AND fit)
+    6.0-7.9 ADJUSTED = VALIDATE FIRST (2-week sprint)
+    <6.0 ADJUSTED = STOP (move on)
 
-HARD STOPS (any = automatic STOP):
-    • Can't name 10 specific people with the problem
-    • Takes >2 weeks to validate core assumption
-    • Requires >$1K to test
-    • You're the only customer you know
-    • Pain score <7 after customer conversations
-    • Competition score <3 (market dominated)
-    • Distribution score <4 (can't reach customers)
+NEW HARD STOPS:
+    • Free alternatives score 8+ (competing with free = death)
+    • Unit economics <4 (making <$30/hr = bad job not business)
 
 Remember: You've started 5 projects, shipped 1, gotten 0 to 10 customers.
-This tool exists to break that pattern.
+Your adjusted score accounts for this. BUILD NOW is harder to get now.
 """)
 
 def run_quick_validation(idea: str, target: str, price: str) -> ValidationResult:
-    """Run a quick validation with only 5 key questions."""
+    """Run a quick validation with only key questions."""
 
     print("\n" + "="*60)
-    print(f"{bold()}⚡ QUICK VALIDATION MODE{reset_color()}")
+    print(f"{bold()}⚡ QUICK VALIDATION MODE V2{reset_color()}")
     print("="*60)
     print(f"\nValidating: {idea}")
     print(f"Target: {target}")
     print(f"Price: {price}")
-    print("\n5 critical questions only. Full validation recommended for BUILD decisions.\n")
+    print("\n6 critical questions only. Full validation recommended for BUILD decisions.\n")
 
     # Key categories for quick screening
-    quick_categories = ["demand_signals", "distribution", "competition", "customer_asks", "founder_market_fit"]
+    quick_categories = ["demand_signals", "distribution", "free_alternatives", "customer_asks", "founder_market_fit", "unit_economics"]
 
     scores = {}
 
-    # Score only key categories
     for key in quick_categories:
         scores[key] = prompt_score(key, CATEGORIES[key])
 
-    # Fill remaining categories with estimates based on quick scores
+    # Fill remaining categories with conservative estimates
     avg_score = sum(scores.values()) / len(scores)
     for key in CATEGORIES:
         if key not in scores:
-            # Conservative estimate
-            scores[key] = max(5.0, avg_score - 1)
+            scores[key] = max(4.0, avg_score - 1.5)  # More conservative
 
-    # Check hard stops
     hard_stops = []
     if scores.get("competition", 10) < 3:
         hard_stops.append(next(r for r in HARD_STOP_RULES if r["id"] == "competition_dominated"))
     if scores.get("distribution", 10) < 4:
         hard_stops.append(next(r for r in HARD_STOP_RULES if r["id"] == "no_distribution"))
+    if scores.get("free_alternatives", 0) >= 8:
+        hard_stops.append(next(r for r in HARD_STOP_RULES if r["id"] == "free_alternative_dominant"))
+    if scores.get("unit_economics", 10) < 4:
+        hard_stops.append(next(r for r in HARD_STOP_RULES if r["id"] == "bad_unit_economics"))
 
-    # Quick hard stop check
     print_header("⚡ QUICK HARD STOP CHECK")
     print("\n  Answer these 2 critical questions:")
 
-    # Most important hard stops
     key_stops = [r for r in HARD_STOP_RULES if r["id"] in ("no_specific_customers", "only_customer")]
     for rule in key_stops:
         if prompt_hard_stop(rule):
@@ -872,10 +952,11 @@ def run_quick_validation(idea: str, target: str, price: str) -> ValidationResult
     rationalizations = check_rationalizations(combined_input, scores)
 
     final_score = calculate_final_score(scores)
-    verdict = get_verdict(final_score, hard_stops)
+    penalty_multiplier, warnings = calculate_execution_risk_penalty(scores)
+    adjusted_score = final_score * penalty_multiplier
+    verdict = get_verdict(final_score, adjusted_score, hard_stops)
     action_items = generate_action_items(scores, verdict)
 
-    # Add note about quick mode
     if verdict != Verdict.STOP:
         action_items.insert(0, "⚡ This was a QUICK validation. Run full validation before committing.")
 
@@ -887,14 +968,15 @@ def run_quick_validation(idea: str, target: str, price: str) -> ValidationResult
         hard_stops_triggered=hard_stops,
         rationalizations_detected=rationalizations,
         final_score=final_score,
+        adjusted_score=adjusted_score,
         verdict=verdict,
         action_items=action_items,
+        warnings=warnings,
     )
 
 def main():
     """Main entry point."""
 
-    # Handle --demo flag
     if len(sys.argv) == 2 and sys.argv[1] == "--demo":
         print("\n" + "="*60)
         print(f"{bold()}📋 DEMO MODE - Sample Validation Output{reset_color()}")
@@ -903,7 +985,6 @@ def main():
         print_validation_result(result)
         sys.exit(0)
 
-    # Handle --quick flag
     if len(sys.argv) >= 2 and sys.argv[1] == "--quick":
         if len(sys.argv) == 5:
             idea = sys.argv[2]
@@ -928,7 +1009,6 @@ def main():
             sys.exit(1)
         sys.exit(0)
 
-    # Handle no arguments - interactive mode
     if len(sys.argv) == 1:
         print_usage()
         print("\n" + "-"*60)
@@ -963,13 +1043,9 @@ def main():
         print_usage()
         sys.exit(1)
 
-    # Run validation
     result = run_interactive_validation(idea, target, price)
-
-    # Print results
     print_validation_result(result)
 
-    # Exit with appropriate code
     if result.verdict == Verdict.STOP:
         sys.exit(2)
     elif result.verdict == Verdict.VALIDATE_FIRST:
