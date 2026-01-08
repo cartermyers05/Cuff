@@ -720,6 +720,62 @@ def run_demo_validation() -> ValidationResult:
         action_items=action_items,
     )
 
+
+def run_idea_validation(idea: str, target: str, price: str, scores: dict, notes: str = "") -> ValidationResult:
+    """Run validation with pre-defined scores for a specific idea."""
+
+    hard_stops = []
+    if scores.get("competition", 10) < 3:
+        hard_stops.append(next(r for r in HARD_STOP_RULES if r["id"] == "competition_dominated"))
+    if scores.get("distribution", 10) < 4:
+        hard_stops.append(next(r for r in HARD_STOP_RULES if r["id"] == "no_distribution"))
+
+    rationalizations = []
+    final_score = calculate_final_score(scores)
+    verdict = get_verdict(final_score, hard_stops)
+
+    # Custom action items for BUILD NOW
+    if verdict == Verdict.BUILD_NOW:
+        action_items = [
+            "✅ GREEN LIGHT - But follow these rules:",
+            "",
+            "📅 WEEK 1 - VALIDATE BEFORE BUILDING:",
+            "  • Post in r/SaaS: 'Would you pay $X for [idea]? Be honest.'",
+            "  • DM 10 people who posted 'should I build X' threads",
+            "  • Offer 3 FREE reports to get testimonials",
+            "  • Goal: 5 people say 'yes I'd pay' (not 'cool idea')",
+            "",
+            "📅 WEEK 2 - MINIMUM VIABLE SERVICE:",
+            "  • Set up Gumroad/Stripe payment link",
+            "  • Create simple intake form (Tally/Typeform)",
+            "  • Deliver first 3 paid reports manually",
+            "  • DO NOT BUILD AUTOMATION YET",
+            "",
+            "⚠️ CONSTRAINTS (based on your history):",
+            f"  • You said 2 weeks = actually 8 weeks. Plan for that.",
+            "  • You quit at week 6. Set a 'no quit' commitment.",
+            "  • 5 started, 0 with 10 customers. Goal: 10 paying customers before ANY automation.",
+            "",
+            "🎯 SUCCESS CRITERIA:",
+            "  • Week 2: First paid customer",
+            "  • Week 4: 5 paying customers",
+            "  • Week 8: 10 paying customers OR pivot/stop",
+        ]
+    else:
+        action_items = generate_action_items(scores, verdict)
+
+    return ValidationResult(
+        idea=idea,
+        target_customer=target,
+        price_point=price,
+        category_scores=scores,
+        hard_stops_triggered=hard_stops,
+        rationalizations_detected=rationalizations,
+        final_score=final_score,
+        verdict=verdict,
+        action_items=action_items,
+    )
+
 def print_usage():
     """Print usage information."""
     print("""
