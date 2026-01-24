@@ -93,7 +93,7 @@ PARAM_GRID_MEDIUM = {
 }
 
 # Trading settings
-STARTING_CAPITAL = 13000
+STARTING_CAPITAL = 40000  # Updated for current capital
 POSITION_SIZE_PCT = 0.30  # 30% of portfolio per trade
 MAX_POSITIONS = 2
 
@@ -220,6 +220,29 @@ class DataManager:
 
         return df
 
+    def _download_stooq(self, symbol: str, start_date: str, end_date: str) -> pd.DataFrame:
+        """Download data from Stooq.com - free historical data"""
+        # Convert symbol for Stooq format
+        stooq_symbol = f"{symbol}.US"
+
+        # Format dates
+        d1 = start_date.replace('-', '')
+        d2 = end_date.replace('-', '')
+
+        url = f'https://stooq.com/q/d/l/?s={stooq_symbol}&d1={d1}&d2={d2}'
+        headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
+
+        response = requests.get(url, headers=headers, timeout=30)
+
+        if response.status_code == 200 and 'Date' in response.text:
+            df = pd.read_csv(io.StringIO(response.text))
+            df['Date'] = pd.to_datetime(df['Date'])
+            df = df.set_index('Date')
+            df = df.sort_index()
+            return df
+        else:
+            raise Exception(f"Stooq failed for {symbol}")
+
     def _download_yahoo_csv(self, symbol: str, start_date: str, end_date: str) -> pd.DataFrame:
         """Download data directly from Yahoo Finance CSV endpoint"""
         # Convert dates to timestamps
@@ -263,9 +286,20 @@ class DataManager:
                 print(f"  Downloading {symbol}...")
                 df = None
 
-                # Try yfinance first if available
-                if HAS_YFINANCE:
+                # Try Stooq first (free, no auth required)
+                try:
+                    print(f"    Trying Stooq...")
+                    df = self._download_stooq(symbol, start_date, end_date)
+                    if len(df) > 0:
+                        print(f"    Got {len(df)} days from Stooq")
+                except Exception as e:
+                    print(f"    Stooq failed: {e}")
+                    df = None
+
+                # Fallback to yfinance if available
+                if (df is None or len(df) == 0) and HAS_YFINANCE:
                     try:
+                        print(f"    Trying yfinance...")
                         ticker = yf.Ticker(symbol)
                         df = ticker.history(start=start_date, end=end_date)
                         if df.empty:
@@ -274,8 +308,8 @@ class DataManager:
                         print(f"    yfinance failed: {e}")
                         df = None
 
-                # Fallback to direct CSV download
-                if df is None or df.empty:
+                # Fallback to direct Yahoo API
+                if df is None or (hasattr(df, '__len__') and len(df) == 0):
                     try:
                         print(f"    Trying direct Yahoo API...")
                         df = self._download_yahoo_csv(symbol, start_date, end_date)
